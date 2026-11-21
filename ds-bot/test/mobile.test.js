@@ -187,9 +187,99 @@ test('plugins falls back to the read-only inventory when there is no bundle mana
   const { call, stop } = start({}, { pluginInventory: inventory })
   t.after(stop)
   const reply = await call('plugins', {})
+  assert.equal(reply.ok, true)
   assert.deepEqual(reply.value, { plugins: [
     { id: 'entry-1', name: 'Chat', description: 'Chat view', enabled: true, manageOnDesktop: true },
+  ], inventory: {
+    entries: [
+      { id: 'entry-1', moduleName: 'chat-view', name: 'Chat', description: 'Chat view', enabled: true },
+    ],
+    presets: [],
+    managementAvailable: false,
+  } })
+})
+
+test('plugins v2 maps the read-only inventory: fiber phases, diagnostics and preset rows', async (t) => {
+  const snapshot = {
+    entries: [
+      { entryId: 'chat', moduleName: 'chat-view', enabled: true, fiberPhase: 'active',
+        meta: { title: { en: 'Chat', zh: '聊天' }, description: { en: 'Chat view' }, icon: 'msg' } },
+      { entryId: 'failed', moduleName: 'broken-view', enabled: false, fiberPhase: null,
+        diagnostic: 'module not found', meta: { title: 'Broken', error: 'boom' } },
+    ],
+    agentPresets: [
+      { id: 'general', name: 'General', isDefault: true, rows: [
+        { entryId: 'chat', moduleName: 'chat-view', enabled: true, fiberPhase: 'active', meta: { title: 'Chat' } },
+        { entryId: null, moduleName: 'missing-view', enabled: 'conditional', condition: 'file attached', fiberPhase: null, meta: { description: 'Only with a file' } },
+      ] },
+      { id: 'broken-preset', name: 'Broken preset', isDefault: false, broken: 'missing module', rows: [] },
+    ],
+    managementAvailable: true,
+  }
+  let calls = 0
+  const inventory = { list: async () => { calls += 1; return snapshot } }
+  const { call, stop } = start({}, { pluginInventory: inventory })
+  t.after(stop)
+  const reply = await call('plugins', {})
+  assert.equal(reply.ok, true)
+  // The v1 array still uses the read-only fallback shape.
+  assert.deepEqual(reply.value.plugins, [
+    { id: 'chat', name: 'Chat', description: 'Chat view', enabled: true, manageOnDesktop: true },
+    { id: 'failed', name: 'Broken', enabled: false, manageOnDesktop: true },
+  ])
+  assert.deepEqual(reply.value.inventory, {
+    entries: [
+      { id: 'chat', moduleName: 'chat-view', name: 'Chat', description: 'Chat view', enabled: true, fiberPhase: 'active' },
+      { id: 'failed', moduleName: 'broken-view', name: 'Broken', enabled: false, fiberPhase: null, diagnostic: 'module not found' },
+    ],
+    presets: [
+      { id: 'general', name: 'General', isDefault: true, rows: [
+        { entryId: 'chat', moduleName: 'chat-view', name: 'Chat', enabled: true, fiberPhase: 'active' },
+        { moduleName: 'missing-view', name: 'missing-view', description: 'Only with a file', enabled: 'conditional', condition: 'file attached', fiberPhase: null },
+      ] },
+      { id: 'broken-preset', name: 'Broken preset', isDefault: false, broken: 'missing module', rows: [] },
+    ],
+    managementAvailable: true,
+  })
+  assert.equal(calls, 1)
+})
+
+test('plugins omits inventory when no inventory service is available', async (t) => {
+  const bundles = [{ name: 'ds-bot', availability: 'installation', enabled: true, rows: [] }]
+  const manager = { listBundles: async () => bundles, setBundleEnabled: async () => ({ application: 'applied' }) }
+  const withManager = start({}, { pluginManager: manager })
+  t.after(withManager.stop)
+  const managed = await withManager.call('plugins', {})
+  assert.deepEqual(managed.value, { plugins: [
+    { id: 'ds-bot', name: 'ds-bot', enabled: true },
   ] })
+  assert.equal('inventory' in managed.value, false)
+
+  const notAService = start({}, { pluginInventory: { list: 'not a function' } })
+  t.after(notAService.stop)
+  const fallback = await notAService.call('plugins', {})
+  assert.deepEqual(fallback.value, { plugins: [] })
+  assert.equal('inventory' in fallback.value, false)
+})
+
+test('plugin-set-enabled passes the failure code and diagnostic through', async (t) => {
+  const manager = {
+    listBundles: async () => [{ name: 'ds-bot', availability: 'installation', enabled: true, rows: [] }],
+    setBundleEnabled: async () => ({ application: 'failed', error: { code: 'operation-error', diagnostic: 'disk full' } }),
+  }
+  const { call, stop } = start({}, { pluginManager: manager })
+  t.after(stop)
+  const reply = await call('plugin-set-enabled', { id: 'ds-bot', enabled: false })
+  assert.equal(reply.ok, false)
+  assert.equal(reply.error.code, 'bot/refused')
+  assert.match(reply.error.message, /operation-error/)
+  assert.match(reply.error.message, /disk full/)
+
+  manager.setBundleEnabled = async () => ({ application: 'cancelled', error: { code: 'management-required' } })
+  const cancelled = await call('plugin-set-enabled', { id: 'ds-bot', enabled: true })
+  assert.equal(cancelled.ok, false)
+  assert.equal(cancelled.error.code, 'bot/refused')
+  assert.match(cancelled.error.message, /management-required/)
 })
 
 test('plugin-set-enabled toggles a manageable bundle and refuses desktop-only ones', async (t) => {

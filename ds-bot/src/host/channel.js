@@ -95,20 +95,64 @@ export function install(rt) {
     plugin.manageOnDesktop = true
     return plugin
   }
+  // The read-only inventory is DSH's full plugin picture: fiber state, failures,
+  // and agent-preset rows. Query it beside the manager so the phone can render
+  // the same detail the desktop plugin page shows.
+  function inventoryPlugin(entry) {
+    const plugin = { id: entry.entryId, moduleName: entry.moduleName, name: localizedText(entry.meta?.title) ?? entry.moduleName }
+    const description = localizedText(entry.meta?.description)
+    if (description !== undefined) plugin.description = description
+    plugin.enabled = entry.enabled === true
+    plugin.fiberPhase = entry.fiberPhase
+    if (entry.diagnostic !== undefined) plugin.diagnostic = entry.diagnostic
+    return plugin
+  }
+  function presetRows(rows) {
+    return (rows ?? []).map(row => {
+      const mapped = {}
+      if (row.entryId !== null) mapped.entryId = row.entryId
+      mapped.moduleName = row.moduleName
+      mapped.name = localizedText(row.meta?.title) ?? row.moduleName
+      const description = localizedText(row.meta?.description)
+      if (description !== undefined) mapped.description = description
+      mapped.enabled = row.enabled
+      if (row.condition !== undefined) mapped.condition = row.condition
+      mapped.fiberPhase = row.fiberPhase
+      return mapped
+    })
+  }
   async function installedPlugins() {
     const manager = ctx.get?.('pluginManager')
+    const inventory = ctx.get?.('pluginInventory')
+    const hasInventory = typeof inventory?.list === 'function'
+    // Only the read-only fallback needs the snapshot for the v1 array; the
+    // manager keeps its one listBundles() call and unchanged v1 mapping.
+    const snapshot = hasInventory && typeof manager?.listBundles !== 'function' ? await inventory.list() : undefined
+    let plugins = []
     if (typeof manager?.listBundles === 'function') {
       const managementAvailable = typeof manager.setBundleEnabled === 'function'
       const bundles = await manager.listBundles()
       // "Installed" excludes on-demand catalog entries whose files are missing.
-      return (bundles ?? []).filter(bundle => bundle?.availability !== 'missing').map(bundle => bundlePlugin(bundle, managementAvailable))
+      plugins = (bundles ?? []).filter(bundle => bundle?.availability !== 'missing').map(bundle => bundlePlugin(bundle, managementAvailable))
+    } else if (hasInventory) {
+      plugins = (snapshot?.entries ?? []).map(entryPlugin)
     }
-    const inventory = ctx.get?.('pluginInventory')
-    if (typeof inventory?.list === 'function') {
-      const snapshot = await inventory.list()
-      return (snapshot?.entries ?? []).map(entryPlugin)
+    const result = { plugins }
+    if (hasInventory) {
+      const full = snapshot ?? await inventory.list()
+      result.inventory = {
+        entries: (full?.entries ?? []).map(inventoryPlugin),
+        presets: (full?.agentPresets ?? []).map(group => {
+          const preset = { id: group.id, isDefault: group.isDefault === true }
+          if (group.name !== undefined) preset.name = group.name
+          if (group.broken !== undefined) preset.broken = group.broken
+          preset.rows = presetRows(group.rows)
+          return preset
+        }),
+        managementAvailable: full?.managementAvailable === true,
+      }
     }
-    return []
+    return result
   }
 
   // Models come from DSH, not state.json, so a provider added on the Models pages of Settings
@@ -1034,7 +1078,7 @@ export function install(rt) {
           await rt.diagnostics.clear()
           return ok(true)
         case 'plugins':
-          return ok({ plugins: await installedPlugins() })
+          return ok(await installedPlugins())
         case 'plugin-set-enabled': {
           const id = body.id
           if (typeof id !== 'string' || id === '') throw invalid('Unknown plugin')
@@ -1050,7 +1094,11 @@ export function install(rt) {
           }
           const result = await manager.setBundleEnabled(id, body.enabled)
           if (result?.application === 'failed' || result?.application === 'cancelled') {
-            const detail = result.error?.code ? ` (${result.error.code})` : ''
+            const error = result.error
+            let detail = ''
+            if (error?.code) {
+              detail = ` (${error.code}${error.diagnostic ? `: ${error.diagnostic}` : ''})`
+            }
             return fail(`Could not change the plug-in${detail}`, 'bot/refused')
           }
           const updated = { ...bundle, enabled: result?.enabled ?? body.enabled }
