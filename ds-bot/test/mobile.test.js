@@ -16,9 +16,9 @@ import { shrink } from '../src/host/preview-worker.js'
 // A team with no model: Sessions are made in memory, a group round runs on answers
 // played back through the session/event listeners, and `history` holds the events
 // each Session's page reads, oldest first.
-function start(config = {}) {
+function start(config = {}, extraServices = {}) {
   const home = mkdtempSync(join(tmpdir(), 'ds-bot-mobile-'))
-  const services = { attachments: fakeAttachments() }
+  const services = { attachments: fakeAttachments(), ...extraServices }
   const ctx = fakeContext({ services })
   const sent = []
   const history = {}
@@ -154,6 +154,79 @@ test('hello names the API version both sides speak, the capabilities and the not
   assert.equal(later.apiMax, API_VERSION)
   // A client that names no version gets the current one.
   assert.equal((await call('hello', {})).value.api, API_VERSION)
+})
+
+test('plugins lists installed DSH bundles with the fields the manager supplies', async (t) => {
+  const bundles = [
+    { name: 'ds-bot', availability: 'installation', enabled: true, version: '1.2.3', description: 'Team bot',
+      meta: { title: { en: 'DS Bot', zh: '机器人' }, description: { en: 'Bot for teams' } },
+      rows: [{ rowId: 'settings', moduleName: 'settings-view', meta: { title: 'Settings' } }, { rowId: 'chat', moduleName: 'chat-view' }] },
+    { name: 'locked-plugin', availability: 'profile', enabled: false, readOnlyReason: 'management-required', rows: [] },
+    { name: 'not-installed', availability: 'missing', enabled: false, rows: [] },
+  ]
+  const calls = []
+  const manager = {
+    listBundles: async () => bundles,
+    setBundleEnabled: async (id, enabled) => { calls.push([id, enabled]); return { application: 'applied', enabled } },
+  }
+  const { call, stop } = start({}, { pluginManager: manager })
+  t.after(stop)
+  const reply = await call('plugins', {})
+  assert.equal(reply.ok, true)
+  assert.deepEqual(reply.value, { plugins: [
+    { id: 'ds-bot', name: 'DS Bot', version: '1.2.3', description: 'Bot for teams', enabled: true,
+      pages: [{ id: 'settings', label: 'Settings' }, { id: 'chat', label: 'chat-view' }] },
+    { id: 'locked-plugin', name: 'locked-plugin', enabled: false, manageOnDesktop: true },
+  ] })
+})
+
+test('plugins falls back to the read-only inventory when there is no bundle manager', async (t) => {
+  const inventory = { list: async () => ({ entries: [
+    { entryId: 'entry-1', moduleName: 'chat-view', enabled: true, meta: { title: 'Chat', description: { en: 'Chat view' } } },
+  ] }) }
+  const { call, stop } = start({}, { pluginInventory: inventory })
+  t.after(stop)
+  const reply = await call('plugins', {})
+  assert.deepEqual(reply.value, { plugins: [
+    { id: 'entry-1', name: 'Chat', description: 'Chat view', enabled: true, manageOnDesktop: true },
+  ] })
+})
+
+test('plugin-set-enabled toggles a manageable bundle and refuses desktop-only ones', async (t) => {
+  const calls = []
+  const bundles = [
+    { name: 'ds-bot', availability: 'installation', enabled: true, version: '1.0.0', rows: [] },
+    { name: 'locked', availability: 'installation', enabled: true, readOnlyReason: 'management-required', rows: [] },
+  ]
+  const manager = {
+    listBundles: async () => bundles,
+    setBundleEnabled: async (id, enabled) => {
+      calls.push([id, enabled])
+      const bundle = bundles.find(item => item.name === id)
+      bundle.enabled = enabled
+      return { application: 'restart-required', enabled }
+    },
+  }
+  const { call, stop } = start({}, { pluginManager: manager })
+  t.after(stop)
+  const off = await call('plugin-set-enabled', { id: 'ds-bot', enabled: false })
+  assert.equal(off.ok, true)
+  assert.deepEqual(off.value, { id: 'ds-bot', name: 'ds-bot', version: '1.0.0', enabled: false })
+  assert.deepEqual(calls, [['ds-bot', false]])
+  const desktop = await call('plugin-set-enabled', { id: 'locked', enabled: false })
+  assert.equal(desktop.ok, false)
+  assert.equal(desktop.error.code, 'bot/manage-on-desktop')
+  const missing = await call('plugin-set-enabled', { id: 'locked-2', enabled: true })
+  assert.equal(missing.error.code, 'bot/not-found')
+  assert.deepEqual(calls, [['ds-bot', false]])
+})
+
+test('plugin-set-enabled reports desktop management without a plugin manager', async (t) => {
+  const { call, stop } = start()
+  t.after(stop)
+  const reply = await call('plugin-set-enabled', { id: 'anything', enabled: true })
+  assert.equal(reply.ok, false)
+  assert.equal(reply.error.code, 'bot/manage-on-desktop')
 })
 
 test('roomItems turns a group Session into speaker-attributed items, oldest first', () => {

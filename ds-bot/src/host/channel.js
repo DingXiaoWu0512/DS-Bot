@@ -59,6 +59,57 @@ export function install(rt) {
   const stagedFiles = new Map()
   const ok = value => ({ ok: true, value })
   const fail = (message, code = 'bot/error') => ({ ok: false, error: { code, message, details: {} } })
+
+  // Plugin display text in DSH metadata is a string or a { en, ... } locale map.
+  const localizedText = value => {
+    if (typeof value === 'string') return value
+    if (value && typeof value === 'object') {
+      if (typeof value.en === 'string') return value.en
+      const first = Object.values(value).find(item => typeof item === 'string')
+      if (first !== undefined) return first
+    }
+    return undefined
+  }
+  // The plugin manager is the bundle-level inventory; the host's read-only
+  // inventory is the fallback when the profile has no manager (e.g. the app's
+  // own profile). Neither service is fabricated when DSH does not provide it.
+  function bundlePlugin(bundle, managementAvailable) {
+    const plugin = { id: bundle.name, name: localizedText(bundle.meta?.title) ?? bundle.name }
+    if (bundle.version !== undefined) plugin.version = bundle.version
+    const description = localizedText(bundle.meta?.description) ?? bundle.description
+    if (description !== undefined) plugin.description = description
+    plugin.enabled = bundle.enabled === true
+    if (!managementAvailable || bundle.readOnlyReason !== undefined) plugin.manageOnDesktop = true
+    if (Array.isArray(bundle.rows) && bundle.rows.length > 0) {
+      plugin.pages = bundle.rows.map(row => ({ id: row.rowId, label: localizedText(row.meta?.title) ?? row.moduleName }))
+    }
+    return plugin
+  }
+  function entryPlugin(entry) {
+    const plugin = { id: entry.entryId, name: localizedText(entry.meta?.title) ?? entry.moduleName }
+    const description = localizedText(entry.meta?.description)
+    if (description !== undefined) plugin.description = description
+    plugin.enabled = entry.enabled === true
+    // No bundle manager means enable/disable can only happen on the desktop.
+    plugin.manageOnDesktop = true
+    return plugin
+  }
+  async function installedPlugins() {
+    const manager = ctx.get?.('pluginManager')
+    if (typeof manager?.listBundles === 'function') {
+      const managementAvailable = typeof manager.setBundleEnabled === 'function'
+      const bundles = await manager.listBundles()
+      // "Installed" excludes on-demand catalog entries whose files are missing.
+      return (bundles ?? []).filter(bundle => bundle?.availability !== 'missing').map(bundle => bundlePlugin(bundle, managementAvailable))
+    }
+    const inventory = ctx.get?.('pluginInventory')
+    if (typeof inventory?.list === 'function') {
+      const snapshot = await inventory.list()
+      return (snapshot?.entries ?? []).map(entryPlugin)
+    }
+    return []
+  }
+
   // Models come from DSH, not state.json, so a provider added on the Models pages of Settings
   // changes the view without a new revision.
   const modelsKey = () => `${rt.cachedCatalog().map(entry => `${entry.ref}${entry.needsKey ? '!' : ''}${entry.reasoning ? `:${JSON.stringify(entry.reasoning)}` : ''}`).join(',')}|${rt.cachedDefault() ?? ''}`
@@ -194,7 +245,7 @@ export function install(rt) {
   }
   // What a host that only reads the team may still answer.
   // Updates change the dsh profile, not the team, so a reading host may run them too.
-  const READS = new Set(['secret-store', 'secret-unlock', 'state', 'models', 'efforts', 'providers', 'provider-models', 'earlier', 'chat', 'run-stats', 'room-progress', 'group-rows', 'exchange', 'exchange-text', 'file-text', 'usage', 'schedules', 'memory-view', 'browser-wait', 'browser-result', 'diagnostics', 'diagnostics-log', 'diagnostics-clear', 'update-check', 'update-install', 'dsh-update-install', 'repo-stars', 'approval-answer', 'thinking', 'avatar-library', 'computer-system-status', 'computer-shot', 'local-agents', 'local-agent-models', 'browser-frame', 'hello', 'notices', 'avatar', 'room-chat', 'usage-summary', 'image', 'markdown-image', 'file-download', 'changes-check', 'changes-summary', 'changes-diff'])
+  const READS = new Set(['secret-store', 'secret-unlock', 'state', 'models', 'efforts', 'providers', 'provider-models', 'earlier', 'chat', 'run-stats', 'room-progress', 'group-rows', 'exchange', 'exchange-text', 'file-text', 'usage', 'schedules', 'memory-view', 'browser-wait', 'browser-result', 'diagnostics', 'diagnostics-log', 'diagnostics-clear', 'update-check', 'update-install', 'dsh-update-install', 'repo-stars', 'approval-answer', 'thinking', 'avatar-library', 'computer-system-status', 'computer-shot', 'local-agents', 'local-agent-models', 'browser-frame', 'hello', 'notices', 'avatar', 'room-chat', 'usage-summary', 'image', 'markdown-image', 'file-download', 'changes-check', 'changes-summary', 'changes-diff', 'plugins'])
 
   async function setPrefs(body) {
     if (body.theme !== undefined) {
@@ -913,6 +964,29 @@ export function install(rt) {
         case 'diagnostics-clear':
           await rt.diagnostics.clear()
           return ok(true)
+        case 'plugins':
+          return ok({ plugins: await installedPlugins() })
+        case 'plugin-set-enabled': {
+          const id = body.id
+          if (typeof id !== 'string' || id === '') throw invalid('Unknown plugin')
+          if (typeof body.enabled !== 'boolean') throw invalid('enabled must be a boolean')
+          const manager = ctx.get?.('pluginManager')
+          if (typeof manager?.setBundleEnabled !== 'function' || typeof manager?.listBundles !== 'function') {
+            return fail('Plug-in management is available on the computer; manage it there.', 'bot/manage-on-desktop')
+          }
+          const bundle = (await manager.listBundles()).find(item => item?.name === id)
+          if (bundle === undefined) return fail('Unknown plugin', 'bot/not-found')
+          if (bundle.readOnlyReason !== undefined) {
+            return fail('This plug-in is managed by the DSH installation; manage it on the computer.', 'bot/manage-on-desktop')
+          }
+          const result = await manager.setBundleEnabled(id, body.enabled)
+          if (result?.application === 'failed' || result?.application === 'cancelled') {
+            const detail = result.error?.code ? ` (${result.error.code})` : ''
+            return fail(`Could not change the plug-in${detail}`, 'bot/refused')
+          }
+          const updated = { ...bundle, enabled: result?.enabled ?? body.enabled }
+          return ok(bundlePlugin(updated, true))
+        }
         default:
           if (endpoint.startsWith('computer-')) {
             await rt.load()
